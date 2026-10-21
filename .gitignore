@@ -12,6 +12,10 @@ poc/config.local.js
 *.jpeg
 *.png
 *.enc
+key.txt
+secrets.txt
+secrets/
+
 
 # Зависимости и временные папки
 node_modules/
