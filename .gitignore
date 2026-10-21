@@ -1,0 +1,20 @@
+# Секреты и локальные переменные окружения
+.env
+.env.*
+!.env.example
+poc/config.local.js
+
+# Ключи, сертификаты и тестовые фото
+*.pem
+*.key
+*.crt
+*.jpg
+*.jpeg
+*.png
+*.enc
+
+# Зависимости и временные папки
+node_modules/
+dist/
+coverage/
+.DS_Store

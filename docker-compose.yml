@@ -1,0 +1,83 @@
+name: cpv1
+
+services:
+  proxy:
+    image: caddy:2.8-alpine
+    container_name: cpv1-proxy
+    restart: unless-stopped
+    ports:
+      - "${CPV1_HTTP_PORT:-18081}:18081"
+      - "${CPV1_HTTPS_PORT:-18443}:18443"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - cpv1-caddy-data:/data
+      - cpv1-caddy-config:/config
+    networks:
+      - cpv1-net
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:18081/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: cpv1-web
+    restart: unless-stopped
+    expose:
+      - "3080"
+    networks:
+      - cpv1-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: cpv1-api
+    restart: unless-stopped
+    expose:
+      - "3000"
+    networks:
+      - cpv1-net
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - PORT=3000
+      - APP_ORIGIN=${APP_ORIGIN:-http://localhost:18081}
+      - STORAGE_MODE=${STORAGE_MODE:-sandbox}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-mock-client-id}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-mock-client-secret}
+      - SESSION_SECRET=${SESSION_SECRET:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}
+      - MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-5242880}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
+networks:
+  cpv1-net:
+    name: cpv1-net
+    driver: bridge
+
+volumes:
+  cpv1-caddy-data:
+    name: cpv1-caddy-data
+  cpv1-caddy-config:
+    name: cpv1-caddy-config

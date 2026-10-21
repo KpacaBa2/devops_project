@@ -1,0 +1,20 @@
+{
+  auto_https off
+}
+
+:18081 {
+  header {
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "no-referrer"
+    Content-Security-Policy "default-src 'self'; script-src 'self' https://accounts.google.com; connect-src 'self' https://www.googleapis.com https://oauth2.googleapis.com https://accounts.google.com; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; frame-src https://accounts.google.com;"
+  }
+
+  handle /api/* {
+    reverse_proxy api:3000
+  }
+
+  handle {
+    reverse_proxy web:3080
+  }
+}

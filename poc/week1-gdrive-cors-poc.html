@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>PoC Недели 1: Полный цикл CPV1 + Google Drive API (drive.file)</title>
+  <!-- Опциональный локальный конфиг (в .gitignore): window.CPV1_LOCAL_CONFIG = { clientId: "..." } -->
+  <script src="./config.local.js" onerror="/* опционально */"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.45; color: #1f2937; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .step { border: 1px solid #d1d5db; border-radius: 8px; padding: 0.9rem; margin-bottom: 0.9rem; background: #ffffff; }
+    .step h3 { margin-top: 0; font-size: 1rem; }
+    pre { background: #111827; color: #e5e7eb; padding: 0.85rem; overflow-x: auto; border-radius: 6px; font-size: 0.82rem; max-height: 360px; overflow-y: auto; }
+    button { padding: 0.45rem 0.9rem; cursor: pointer; border-radius: 6px; border: 1px solid #2563eb; background: #2563eb; color: #fff; font-weight: 500; margin-right: 0.4rem; margin-top: 0.4rem; }
+    button:disabled { background: #9ca3af; border-color: #9ca3af; cursor: not-allowed; }
+    button.secondary { background: #059669; border-color: #059669; }
+    button.restore { background: #7c3aed; border-color: #7c3aed; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.45rem; margin: 0.35rem 0; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 4px; font-family: monospace; }
+    .preview-box { display: flex; gap: 1rem; align-items: center; margin-top: 0.5rem; flex-wrap: wrap; }
+    .preview-card { border: 1px dashed #94a3b8; padding: 0.5rem; border-radius: 6px; text-align: center; font-size: 0.8rem; }
+    .preview-card img, .preview-card canvas { max-width: 220px; border-radius: 4px; display: block; margin-bottom: 0.25rem; }
+  </style>
+</head>
+<body>
+  <h1>PoC Недели 1: Полный сценарий CPV1 + Google Drive API (CORS, SHA-256, Восстановление)</h1>
+  <p>Никакие токены и ключи не выводятся в журнал или консоль. Для теста автоматически генерируется синтетический JPEG в браузере (личные фото не используются).</p>
+
+  <div class="step">
+    <h3>Конфигурация (Google OAuth Client ID и мастер-пароль)</h3>
+    <label for="clientId">Google OAuth Client ID (Web application, origin: <code>http://localhost:18080</code>):</label>
+    <input id="clientId" type="text" placeholder="Введите Client ID или задайте в poc/config.local.js" autocomplete="off" />
+    <label for="password">Пароль для PBKDF2-HMAC-SHA256 (600 000 итераций):</label>
+    <input id="password" type="password" value="Coursework-DevOps-2026-Test!" autocomplete="off" />
+  </div>
+
+  <div class="grid">
+    <div class="step">
+      <h3>Основной сценарий (Шаги 1–5)</h3>
+      <button id="btnStep1">1. Войти через Google (drive.file)</button><br />
+      <button id="btnStep2">2. Сгенерировать JPEG + Зашифровать (CPV1)</button><br />
+      <button id="btnStep3" disabled>3. Загрузить blob.enc и vault-meta.json в Drive</button><br />
+      <button id="btnStep4" disabled>4. Список файлов приложения в Drive</button><br />
+      <button id="btnStep5" disabled>5. Скачать, проверить CPV1 и SHA-256</button>
+    </div>
+
+    <div class="step">
+      <h3>Проверка восстановления (Шаг 6)</h3>
+      <p style="font-size: 0.88rem; margin-top: 0;">Очищает память вкладки, ключи, хеши и локальное состояние (имитация нового браузера / режима Инкогнито), затем восстанавливает галерею из Google Drive <strong>только по паролю и входу в Google</strong>.</p>
+      <button id="btnRestore" class="restore">6. Восстановить из чистого состояния</button>
+    </div>
+  </div>
+
+  <div class="step">
+    <h3>Визуальная проверка изображений</h3>
+    <div class="preview-box">
+      <div class="preview-card">
+        <strong>1. Сгенерированный оригинал (JPEG)</strong>
+        <canvas id="origCanvas" width="240" height="140"></canvas>
+        <span id="origInfo">Не создан</span>
+      </div>
+      <div class="preview-card">
+        <strong>2. Расшифровано после скачивания (Шаг 5)</strong>
+        <img id="decImg" alt="Ожидание Шага 5" />
+        <span id="decInfo">Ожидание</span>
+      </div>
+      <div class="preview-card">
+        <strong>3. Восстановлено с нуля (Шаг 6)</strong>
+        <img id="restoredImg" alt="Ожидание Шага 6" />
+        <span id="restoredInfo">Ожидание</span>
+      </div>
+    </div>
+  </div>
+
+  <h3>Журнал проверки и сетевых запросов (без токенов и секретов):</h3>
+  <pre id="log">[ГОТОВО К ЗАПУСКУ] Откройте http://localhost:18080/week1-gdrive-cors-poc.html</pre>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      const ts = new Date().toISOString().slice(11, 19);
+      logEl.textContent += `\n[${ts}] ${msg}`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    // Автоподстановка Client ID из опционального poc/config.local.js (файл в .gitignore)
+    if (window.CPV1_LOCAL_CONFIG && window.CPV1_LOCAL_CONFIG.clientId) {
+      document.getElementById('clientId').value = window.CPV1_LOCAL_CONFIG.clientId;
+      log('Client ID загружен из локального poc/config.local.js');
+    }
+
+    // Константы криптосхемы CPV1
+    const CPV1_AAD = new Uint8Array([0x43, 0x50, 0x56, 0x31, 0x01]); // "CPV1\x01"
+    const PBKDF2_ITERATIONS = 600000;
+    const REQUIRED_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+
+    // Состояние в памяти вкладки (очищается кнопкой «Восстановить из чистого состояния»)
+    let accessToken = null;
+    let state = {
+      originalJpegBytes: null,
+      originalSha256Hex: null,
+      dekCryptoKey: null,
+      encryptedBlobPacket: null,
+      vaultMetaObject: null,
+      uploadedBlobFileId: null,
+      uploadedMetaFileId: null,
+    };
+
+    function toHex(uint8) {
+      return Array.from(uint8).map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function toSpacedHex(uint8) {
+      return Array.from(uint8).map((b) => b.toString(16).padStart(2, '0')).join(' ');
+    }
+
+    function bytesToBase64(uint8) {
+      let bin = '';
+      for (let i = 0; i < uint8.byteLength; i++) bin += String.fromCharCode(uint8[i]);
+      return btoa(bin);
+    }
+
+    function base64ToBytes(b64) {
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    async function sha256Hex(bufferOrUint8) {
+      const digest = await crypto.subtle.digest('SHA-256', bufferOrUint8);
+      return toHex(new Uint8Array(digest));
+    }
+
+    // Обертка fetch: логирует только МЕТОД, чистый URL и HTTP-статус (без токенов)
+    async function loggedFetch(url, options = {}) {
+      const method = options.method || 'GET';
+      try {
+        const res = await fetch(url, options);
+        log(`[HTTP] ${method} ${url} -> статус ${res.status}`);
+        return res;
+      } catch (err) {
+        log(`[HTTP/CORS ОШИБКА] ${method} ${url} -> ${err.message}`);
+        throw err;
+      }
+    }
+
+    // Генерация синтетического JPEG через <canvas> (без личных фото)
+    async function generateSyntheticJpeg() {
+      const canvas = document.getElementById('origCanvas');
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#1e3a8a';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillRect(14, 14, canvas.width - 28, canvas.height - 28);
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.fillText('CPV1 DevOps PoC JPEG', 28, 55);
+      ctx.font = '13px monospace';
+      ctx.fillText(new Date().toISOString().slice(0, 19), 28, 85);
+      ctx.fillText('No plaintext in Drive!', 28, 110);
+
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+      const arrayBuf = await blob.arrayBuffer();
+      return new Uint8Array(arrayBuf);
+    }
+
+    // PBKDF2-HMAC-SHA256 (600 000 итераций) -> KEK
+    async function deriveKek(password, saltBytes, iterations = PBKDF2_ITERATIONS) {
+      const enc = new TextEncoder();
+      const baseKey = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
+      return crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: saltBytes, iterations, hash: 'SHA-256' },
+        baseKey,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    // Упаковка и шифрование в CPV1 (AAD = "CPV1\x01")
+    async function encryptCpv1Packet(plainUint8, aesKey) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const cipherBuf = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv, additionalData: CPV1_AAD, tagLength: 128 },
+        aesKey,
+        plainUint8
+      );
+      const cipherBytes = new Uint8Array(cipherBuf);
+      const packet = new Uint8Array(CPV1_AAD.byteLength + iv.byteLength + cipherBytes.byteLength);
+      packet.set(CPV1_AAD, 0);
+      packet.set(iv, CPV1_AAD.byteLength);
+      packet.set(cipherBytes, CPV1_AAD.byteLength + iv.byteLength);
+      return packet;
+    }
+
+    // Проверка заголовка CPV1\x01 и расшифровка с проверкой AAD
+    async function decryptCpv1Packet(packetUint8, aesKey) {
+      if (packetUint8.byteLength < 33) {
+        throw new Error('Пакет меньше минимальных 33 байт CPV1');
+      }
+      const header = packetUint8.slice(0, 5);
+      for (let i = 0; i < 5; i++) {
+        if (header[i] !== CPV1_AAD[i]) {
+          throw new Error(`Неверный заголовок CPV1: ${toSpacedHex(header)}`);
+        }
+      }
+      const iv = packetUint8.slice(5, 17);
+      const ciphertextWithTag = packetUint8.slice(17);
+      const plainBuf = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv, additionalData: header, tagLength: 128 },
+        aesKey,
+        ciphertextWithTag
+      );
+      return new Uint8Array(plainBuf);
+    }
+
+    // Загрузка бинарного объекта в Google Drive через multipart/related
+    async function uploadMultipartToDrive(name, bytesUint8) {
+      const metadata = { name, mimeType: 'application/octet-stream' };
+      const boundary = '-------cpv1_poc_boundary_' + crypto.randomUUID();
+      const metaPart =
+        `--${boundary}\r\n` +
+        `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+        `${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Type: application/octet-stream\r\n\r\n`;
+      const closePart = `\r\n--${boundary}--`;
+      const body = new Blob([metaPart, bytesUint8, closePart]);
+
+      const res = await loggedFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`,
+        },
+        body,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(`Ошибка загрузки ${name} (${res.status}): ${data.error?.message || 'unknown'}`);
+      }
+      return data;
+    }
+
+    // ШАГ 1: Вход через Google (GIS Token Model, только drive.file)
+    function requestGoogleAuth(onSuccess) {
+      const clientId = document.getElementById('clientId').value.trim();
+      if (!clientId) {
+        alert('Введите Google OAuth Client ID в верхнее поле');
+        return;
+      }
+      const tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: REQUIRED_SCOPE,
+        callback: (resp) => {
+          if (resp.error) {
+            log(`[ШАГ 1 FAIL] Ошибка OAuth: ${resp.error} (${resp.error_description || ''})`);
+            return;
+          }
+          accessToken = resp.access_token;
+          const grantedOnlyDriveFile = google.accounts.oauth2.hasGrantedAllScopes(resp, REQUIRED_SCOPE);
+          log(`[ШАГ 1 PASS] Вход выполнен. Выданные scopes: "${resp.scope}". Проверка drive.file: ${grantedOnlyDriveFile}, срок жизни токена: ${resp.expires_in} сек.`);
+          if (state.encryptedBlobPacket) {
+            document.getElementById('btnStep3').disabled = false;
+          }
+          if (onSuccess) onSuccess();
+        },
+      });
+      tokenClient.requestAccessToken({ prompt: 'consent' });
+    }
+
+    document.getElementById('btnStep1').addEventListener('click', () => requestGoogleAuth());
+
+    // ШАГ 2: Генерация тестового JPEG + Шифрование (PBKDF2 600k, DEK, wrap, CPV1 + AAD)
+    document.getElementById('btnStep2').addEventListener('click', async () => {
+      try {
+        if (!window.crypto?.subtle) {
+          throw new Error('window.crypto.subtle недоступен! Используйте http://localhost:18080');
+        }
+        const password = document.getElementById('password').value;
+        if (!password) throw new Error('Введите мастер-пароль');
+
+        log('[ШАГ 2] Генерация синтетического тестового JPEG на <canvas>...');
+        const jpegBytes = await generateSyntheticJpeg();
+        const origHash = await sha256Hex(jpegBytes);
+        state.originalJpegBytes = jpegBytes;
+        state.originalSha256Hex = origHash;
+        document.getElementById('origInfo').textContent = `${jpegBytes.byteLength} байт, SHA-256: ${origHash.slice(0, 12)}...`;
+        log(`[ШАГ 2] Сгенерирован JPEG: ${jpegBytes.byteLength} байт, первые 4 байта: ${toSpacedHex(jpegBytes.slice(0, 4))}, SHA-256: ${origHash}`);
+
+        log(`[ШАГ 2] Вычисление KEK через PBKDF2-HMAC-SHA256 (${PBKDF2_ITERATIONS} итераций)...`);
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const kek = await deriveKek(password, salt, PBKDF2_ITERATIONS);
+
+        // Генерация случайного 256-битного DEK и его обертывание (Key Wrapping) ключом KEK с AAD = CPV1\x01
+        const dek = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+        const rawDekBytes = new Uint8Array(await crypto.subtle.exportKey('raw', dek));
+        const wrapIv = crypto.getRandomValues(new Uint8Array(12));
+        const wrappedDekBuf = await crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv: wrapIv, additionalData: CPV1_AAD, tagLength: 128 },
+          kek,
+          rawDekBytes
+        );
+
+        // Шифрование самого JPEG ключом DEK в формат CPV1 (AAD = "CPV1\x01")
+        const encryptedPacket = await encryptCpv1Packet(jpegBytes, dek);
+        state.dekCryptoKey = dek;
+        state.encryptedBlobPacket = encryptedPacket;
+        state.vaultMetaObject = {
+          format: 'CPV1',
+          version: 1,
+          createdAt: new Date().toISOString(),
+          kdf: {
+            algorithm: 'PBKDF2',
+            hash: 'SHA-256',
+            iterations: PBKDF2_ITERATIONS,
+            saltBase64: bytesToBase64(salt),
+          },
+          wrappedKey: {
+            algorithm: 'AES-256-GCM',
+            aadHex: toHex(CPV1_AAD),
+            ivBase64: bytesToBase64(wrapIv),
+            ciphertextBase64: bytesToBase64(new Uint8Array(wrappedDekBuf)),
+          },
+          latestBlobFileId: null,
+          latestBlobSha256: origHash,
+        };
+
+        log(`[ШАГ 2 PASS] Фото зашифровано в CPV1 (${encryptedPacket.byteLength} байт = оригинал + 33 байта).`);
+        log(`[ШАГ 2 ПРОВЕРКА] Первые 5 байт зашифрованного пакета: ${toSpacedHex(encryptedPacket.slice(0, 5))} ("CPV1\\x01"). Сигнатура JPEG (ff d8 ff) отсутствует!`);
+
+        if (accessToken) {
+          document.getElementById('btnStep3').disabled = false;
+        }
+      } catch (err) {
+        log(`[ШАГ 2 FAIL] ${err.message}`);
+      }
+    });
+
+    // ШАГ 3: Загрузка blob_<uuid>.enc и vault-meta.json в Google Drive
+    document.getElementById('btnStep3').addEventListener('click', async () => {
+      try {
+        const blobName = `blob_${crypto.randomUUID()}.enc`;
+        log(`[ШАГ 3] Загрузка ${blobName} в Google Drive (application/octet-stream)...`);
+        const blobFile = await uploadMultipartToDrive(blobName, state.encryptedBlobPacket);
+        state.uploadedBlobFileId = blobFile.id;
+        state.vaultMetaObject.latestBlobFileId = blobFile.id;
+        state.vaultMetaObject.latestBlobName = blobName;
+        log(`[ШАГ 3] Загружен зашифрованный блоб: name=${blobFile.name}, fileId=${blobFile.id}`);
+
+        const metaBytes = new TextEncoder().encode(JSON.stringify(state.vaultMetaObject, null, 2));
+        log(`[ШАГ 3] Загрузка vault-meta.json в Google Drive (application/octet-stream)...`);
+        const metaFile = await uploadMultipartToDrive('vault-meta.json', metaBytes);
+        state.uploadedMetaFileId = metaFile.id;
+        log(`[ШАГ 3 PASS] Загружен vault-meta.json: fileId=${metaFile.id}. Проверьте в drive.google.com, что ${blobFile.name} не открывается как картинка.`);
+
+        document.getElementById('btnStep4').disabled = false;
+        document.getElementById('btnStep5').disabled = false;
+      } catch (err) {
+        log(`[ШАГ 3 FAIL] ${err.message}`);
+      }
+    });
+
+    // ШАГ 4: Список файлов, созданных приложением (drive.file)
+    document.getElementById('btnStep4').addEventListener('click', async () => {
+      try {
+        const listUrl = 'https://www.googleapis.com/drive/v3/files?pageSize=15&q=trashed=false&fields=files(id,name,mimeType,size,createdTime)';
+        const res = await loggedFetch(listUrl, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        log(`[ШАГ 4 PASS] Найдено файлов приложения (scope drive.file): ${data.files.length}`);
+        for (const f of data.files) {
+          log(`  - ${f.name} | id=${f.id} | mime=${f.mimeType} | size=${f.size} байт`);
+        }
+      } catch (err) {
+        log(`[ШАГ 4 FAIL] ${err.message}`);
+      }
+    });
+
+    // ШАГ 5: Скачивание blob_<uuid>.enc -> проверка CPV1 -> расшифровка -> сравнение SHA-256
+    document.getElementById('btnStep5').addEventListener('click', async () => {
+      try {
+        const dlUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(state.uploadedBlobFileId)}?alt=media`;
+        const res = await loggedFetch(dlUrl, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!res.ok) throw new Error(`Ошибка скачивания HTTP ${res.status}`);
+        const downloadedBytes = new Uint8Array(await res.arrayBuffer());
+        const first5Hex = toSpacedHex(downloadedBytes.slice(0, 5));
+        const isCpv1 = first5Hex === '43 50 56 31 01';
+        const isJpeg = toSpacedHex(downloadedBytes.slice(0, 3)) === 'ff d8 ff';
+
+        log(`[ШАГ 5] Скачано ${downloadedBytes.byteLength} байт. Первые 5 байт: ${first5Hex} (CPV1=${isCpv1}, JPEG=${isJpeg})`);
+        if (!isCpv1 || isJpeg) {
+          throw new Error('Скачанный файл не начинается с заголовка CPV1\\x01!');
+        }
+
+        const decryptedBytes = await decryptCpv1Packet(downloadedBytes, state.dekCryptoKey);
+        const decryptedSha256 = await sha256Hex(decryptedBytes);
+        const match = decryptedSha256 === state.originalSha256Hex;
+
+        log(`[ШАГ 5] SHA-256 оригинала:     ${state.originalSha256Hex}`);
+        log(`[ШАГ 5] SHA-256 расшифрованного: ${decryptedSha256}`);
+        if (!match) {
+          throw new Error('SHA-256 НЕ СОВПАЛ!');
+        }
+        log('[ШАГ 5 PASS] SHA-256 совпал на 100%! Отрисовка расшифрованного JPEG...');
+        const blobUrl = URL.createObjectURL(new Blob([decryptedBytes], { type: 'image/jpeg' }));
+        document.getElementById('decImg').src = blobUrl;
+        document.getElementById('decInfo').textContent = `SHA-256 совпал (${decryptedBytes.byteLength} байт)`;
+      } catch (err) {
+        log(`[ШАГ 5 FAIL] ${err.message}`);
+      }
+    });
+
+    // ШАГ 6: Отдельная кнопка «Восстановить из чистого состояния»
+    document.getElementById('btnRestore').addEventListener('click', async () => {
+      // 1. Полный сброс локального состояния в памяти и хранилищах браузера
+      state = {
+        originalJpegBytes: null,
+        originalSha256Hex: null,
+        dekCryptoKey: null,
+        encryptedBlobPacket: null,
+        vaultMetaObject: null,
+        uploadedBlobFileId: null,
+        uploadedMetaFileId: null,
+      };
+      try {
+        localStorage.clear();
+        sessionStorage.clear();
+      } catch (_) {}
+      document.getElementById('btnStep3').disabled = true;
+      document.getElementById('btnStep4').disabled = true;
+      document.getElementById('btnStep5').disabled = true;
+      log('[ШАГ 6 СБРОС] Все ключи (DEK), ID файлов и локальное состояние полностью очищены из памяти браузера.');
+
+      const runRestoreFlow = async () => {
+        try {
+          const password = document.getElementById('password').value;
+          if (!password) throw new Error('Введите мастер-пароль для восстановления');
+
+          // 2. Поиск последнего vault-meta.json в Google Drive
+          const q = encodeURIComponent("name = 'vault-meta.json' and trashed = false");
+          const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=createdTime%20desc&pageSize=1&fields=files(id,name,createdTime)`;
+          const listRes = await loggedFetch(searchUrl, {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          const listData = await listRes.json();
+          if (!listRes.ok || !listData.files?.length) {
+            throw new Error('Файл vault-meta.json не найден в Google Drive');
+          }
+          const metaFile = listData.files[0];
+          log(`[ШАГ 6] Найден vault-meta.json в Drive (id=${metaFile.id}, created=${metaFile.createdTime}). Скачивание...`);
+
+          // 3. Скачивание vault-meta.json
+          const metaRes = await loggedFetch(
+            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(metaFile.id)}?alt=media`,
+            { method: 'GET', headers: { Authorization: `Bearer ${accessToken}` } }
+          );
+          if (!metaRes.ok) throw new Error(`Ошибка скачивания vault-meta.json: HTTP ${metaRes.status}`);
+          const vaultMeta = await metaRes.json();
+
+          // 4. Вывод KEK из пароля и распаковка (unwrap) DEK с проверкой AAD = CPV1\x01
+          log(`[ШАГ 6] Вывод KEK из пароля (PBKDF2, ${vaultMeta.kdf.iterations} итераций) и расшифровка DEK...`);
+          const salt = base64ToBytes(vaultMeta.kdf.saltBase64);
+          const kek = await deriveKek(password, salt, vaultMeta.kdf.iterations);
+          const wrapIv = base64ToBytes(vaultMeta.wrappedKey.ivBase64);
+          const wrappedCipher = base64ToBytes(vaultMeta.wrappedKey.ciphertextBase64);
+
+          const rawDekBuf = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: wrapIv, additionalData: CPV1_AAD, tagLength: 128 },
+            kek,
+            wrappedCipher
+          );
+          const restoredDek = await crypto.subtle.importKey(
+            'raw',
+            rawDekBuf,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['decrypt']
+          );
+          log('[ШАГ 6] Мастер-ключ DEK успешно восстановлен из пароля!');
+
+          // 5. Скачивание зашифрованного блоба по ID из vault-meta.json
+          const blobId = vaultMeta.latestBlobFileId;
+          log(`[ШАГ 6] Скачивание зашифрованного фото (${vaultMeta.latestBlobName}, id=${blobId})...`);
+          const blobRes = await loggedFetch(
+            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(blobId)}?alt=media`,
+            { method: 'GET', headers: { Authorization: `Bearer ${accessToken}` } }
+          );
+          if (!blobRes.ok) throw new Error(`Ошибка скачивания блоба: HTTP ${blobRes.status}`);
+          const encBytes = new Uint8Array(await blobRes.arrayBuffer());
+          log(`[ШАГ 6] Первые 5 байт скачанного файла: ${toSpacedHex(encBytes.slice(0, 5))} ("CPV1\\x01")`);
+
+          // 6. Расшифровка фото и проверка SHA-256
+          const restoredJpeg = await decryptCpv1Packet(encBytes, restoredDek);
+          const restoredSha256 = await sha256Hex(restoredJpeg);
+          const shaMatch = restoredSha256 === vaultMeta.latestBlobSha256;
+
+          log(`[ШАГ 6] SHA-256 восстановленного фото: ${restoredSha256} (совпадение с эталоном: ${shaMatch})`);
+          if (!shaMatch) throw new Error('SHA-256 восстановленного файла не совпал с эталоном!');
+
+          const url = URL.createObjectURL(new Blob([restoredJpeg], { type: 'image/jpeg' }));
+          document.getElementById('restoredImg').src = url;
+          document.getElementById('restoredInfo').textContent = `Восстановлено! SHA-256 совпал (${restoredJpeg.byteLength} байт)`;
+          log('[ШАГ 6 PASS] ПОЛНОЕ ВОССТАНОВЛЕНИЕ ИЗ ЧИСТОГО СОСТОЯНИЯ УСПЕШНО ЗАВЕРШЕНО!');
+        } catch (err) {
+          log(`[ШАГ 6 FAIL] Ошибка восстановления (проверьте пароль или доступ): ${err.message}`);
+        }
+      };
+
+      if (!accessToken) {
+        log('[ШАГ 6] Токен в памяти отсутствует (например, приватное окно) — запрашиваем вход через Google...');
+        requestGoogleAuth(runRestoreFlow);
+      } else {
+        await runRestoreFlow();
+      }
+    });
+  </script>
+</body>
+</html>

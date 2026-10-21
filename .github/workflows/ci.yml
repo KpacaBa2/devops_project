@@ -1,0 +1,86 @@
+name: CI — Lint, Unit Tests, Docker Compose Build & Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify-and-smoke-test:
+    name: Verify Code & Run Compose Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Syntax & Lint Check (JS modules)
+        run: |
+          node --check web/src/crypto/cpv1.js
+          node --check web/src/storage/storage-adapter.js
+          node --check api/server.js
+          node --check tests/cpv1-and-no-jpeg.test.mjs
+
+      - name: Run Unit & Crypto Security Tests (CPV1 + AAD + No Plaintext JPEG)
+        run: |
+          node --test tests/cpv1-and-no-jpeg.test.mjs
+
+      - name: Prepare .env from .env.example
+        run: |
+          cp .env.example .env
+
+      - name: Build and Start Docker Compose Stack (Wait for Healthchecks)
+        run: |
+          docker compose -p cpv1 up -d --build --wait
+
+      - name: Smoke Test 1 — Check Health & CSP Header via Reverse Proxy
+        run: |
+          curl -fsS -I http://127.0.0.1:18081/api/health | grep -i "Content-Security-Policy"
+          curl -fsS http://127.0.0.1:18081/api/health | grep '"status":"ok"'
+
+      - name: Smoke Test 2 — Ensure Plaintext JPEG is REJECTED (HTTP 400)
+        run: |
+          printf '\xff\xd8\xff\xe0\x00\x10JFIF\x00' > /tmp/plain.jpg
+          HTTP_CODE=$(curl -s -o /tmp/reject.json -w "%{http_code}" \
+            -X POST http://127.0.0.1:18081/api/sandbox/objects \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @/tmp/plain.jpg)
+          cat /tmp/reject.json
+          test "$HTTP_CODE" = "400"
+          grep -q "PLAINTEXT_JPEG_REJECTED" /tmp/reject.json
+
+      - name: Smoke Test 3 — Ensure Valid CPV1 Encrypted Object is ACCEPTED (HTTP 201)
+        run: |
+          node -e '
+            import("./web/src/crypto/cpv1.js").then(async ({ generateDek, encryptCpv1 }) => {
+              const fs = await import("node:fs");
+              const dek = await generateDek();
+              const plain = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+              const enc = await encryptCpv1(plain, dek);
+              fs.writeFileSync("/tmp/valid.cpv1.enc", Buffer.from(enc));
+            });
+          '
+          HTTP_CODE=$(curl -s -o /tmp/accept.json -w "%{http_code}" \
+            -X POST http://127.0.0.1:18081/api/sandbox/objects \
+            -H "Content-Type: application/octet-stream" \
+            -H "X-Object-Name: smoke_test.enc" \
+            --data-binary @/tmp/valid.cpv1.enc)
+          cat /tmp/accept.json
+          test "$HTTP_CODE" = "201"
+
+      - name: Print Docker Compose Logs on Failure
+        if: failure()
+        run: |
+          docker compose -p cpv1 logs
+
+      - name: Tear Down Docker Compose Stack
+        if: always()
+        run: |
+          docker compose -p cpv1 down -v
